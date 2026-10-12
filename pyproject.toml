@@ -31,6 +31,11 @@ dev = [
     "pytest-cov", # Used to report total code coverage
     "ruff", # Used for static linting of files
 ]
+
+hyrax = [
+    "hyrax", # Needed for Hyrax-based WorkerPlugins
+]
+
 # Command-line scripts that can be run after installing the package
 [project.scripts]
 lsdb_ml_version = "lsdb_ml_cli.lsdb_ml_version:main"
