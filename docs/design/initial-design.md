@@ -1,6 +1,19 @@
 # lsdb-ml: initial design for LSDB ↔ PyTorch training and inference
 
-Status: **draft, for review.** Nothing in this document is implemented yet.
+Status: **approved with changes** (see "Review decisions" below). Implementation in progress.
+
+### Review decisions
+
+1. **Device:** `"cpu"` is the default for training and inference; `"auto"` is opt-in.
+2. **Batching follows Dask's chunks.** A batch never crosses a chunk boundary. Each chunk
+   from the stream (one or more stacked partitions) is yielded whole (`batch_size=None`)
+   or cut into consecutive slices of at most `batch_size` rows. There is no cross-chunk
+   carry-over buffer, so ragged batches are normal. Uneven step counts across DDP ranks
+   are handled with `model.join()`.
+3. **Shuffling stays as `CatalogStream` provides it.** No cross-chunk shuffle buffer.
+   Useful upstream `CatalogStream` changes are collected in §14 rather than worked around.
+4. **Upstream issues are not opened from this work.** Their rough shape is recorded in
+   §14 for the maintainer to file.
 
 ## 1. Goals and non-goals
 
@@ -111,7 +124,7 @@ src/lsdb_ml/
     data/
         sharding.py        # ShardInfo, rank/worker discovery, per-epoch partition assignment
         source.py          # PartitionSource protocol + CatalogStreamSource (wraps lsdb CatalogStream)
-        batching.py        # RowBatcher: re-chunks ragged frames into exact-size row batches
+        batching.py        # iter_slices: cuts each chunk into <= batch_size row slices
         dataset.py         # CatalogIterableDataset
     training/
         steps.py           # TrainStep protocol, SupervisedStep
@@ -231,13 +244,15 @@ lsdb.Catalog (lazy)
             └─ lsdb CatalogStream(sub, client, partitions_per_chunk, shuffle, seed=derived)
                  └─ NestedFrame chunks (ragged sizes)            ← producer (Dask)
   ─────────────────────────────────────────── seam: PartitionSource.iter_chunks(epoch) ───
-  └─ RowBatcher: buffers across chunks, emits exactly batch_size rows (final batch may be short)
+  └─ iter_slices: whole chunk, or consecutive <= batch_size slices within it (never across chunks)
        └─ resolved.collate(frame_slice) -> dict[str, Tensor]      ← consumer (torch)
             └─ DataLoader(batch_size=None, num_workers=k)
                  └─ TrainSession
 ```
 
-Batching happens on frame rows and each batch is collated in one vectorized call. The
+Batching happens on frame rows within one chunk, and each batch is collated in one
+vectorized call. Keeping batches inside a chunk means no frame concatenation on the torch
+side and keeps the unit of work aligned with Dask's. The
 dataset yields batches that are already collated, so the DataLoader runs with
 `batch_size=None` and there is no per-sample dict plus `collate_fn` step, which would be
 slow for nested data.
@@ -302,7 +317,7 @@ session.
 ```python
 ds = CatalogIterableDataset(
     catalog, spec,
-    batch_size=256, drop_last=False,
+    batch_size=256,           # max rows per batch; None = one batch per chunk
     shuffle=True, seed=0,
     epochs=1,                 # int, or None = stream forever (reseeded every pass)
     partitions_per_chunk=4,
@@ -324,9 +339,8 @@ loader = DataLoader(ds, batch_size=None, num_workers=2)
 
 ### 5.5 Buffering, backpressure and memory
 
-- **Per producer, memory is about 2 chunks plus one batch.** That is the chunk being
-  consumed, one prefetched chunk (finding 1), and `RowBatcher`'s carry-over of fewer than
-  `batch_size` rows.
+- **Per producer, memory is about 2 chunks.** That is the chunk being consumed and one
+  prefetched chunk (finding 1). There is no carry-over buffer.
 - **The DataLoader adds a bounded amount.** It holds up to `prefetch_factor * num_workers`
   collated batches.
 - **No queue is unbounded.** Backpressure comes naturally: a producer only submits its
@@ -341,8 +355,8 @@ loader = DataLoader(ds, batch_size=None, num_workers=2)
 HEALPix partitions are spatially coherent, so rows that share a chunk are sky neighbors,
 and batches drawn from one chunk are not i.i.d. The available mitigations are
 `partitions_per_chunk>1`, together with `CatalogStream`'s within-chunk row shuffle, and
-partition-order shuffling. An optional cross-chunk shuffle buffer (`shuffle_buffer=`
-rows) is a natural follow-up; see §10. The docs will state the caveat plainly.
+partition-order shuffling. Per the review, no cross-chunk shuffle buffer is added here;
+better mixing belongs upstream in `CatalogStream` (§14). The docs will state the caveat.
 
 ## 6. Training session
 
@@ -412,8 +426,8 @@ Behavior carried over from #1053's spec:
   returns the model (unwrapped from DDP if needed). It is idempotent, and `__exit__`
   calls it.
 - **Per-batch weighting, documented.** Every optimizer step has equal weight no matter
-  the batch size, so a 3-row tail batch steps as hard as a full one. Use `drop_last=True`
-  or `min_batch_size` to avoid this.
+  the batch size, so a 3-row tail slice of a chunk steps as hard as a full one. Use
+  `min_batch_size` to skip small slices.
 
 **Checkpoints** are written atomically (temporary file, then rename) as a `torch.save`
 dict containing `model` (state_dict), `step` (from `step.state_dict()` if present),
@@ -559,7 +573,7 @@ zero-length and null nested rows) and a distributed client fixture.
 |---|---|
 | Spec validation against meta | Missing column; flat vs nested mismatch; missing sub-column; string without `transform`; duplicate keys; all errors reported together; **no compute** (assert via a catalog whose partitions raise if computed). |
 | Collation, flat and nested | Shapes, dtypes and values against a per-row reference implementation; mask and lengths; `max_length` truncation (head and tail); `pad_to`; null nested rows give length 0; writable tensors. |
-| Ragged and empty batches | `RowBatcher` across uneven chunks gives exact sizes and a short tail; `drop_last`; empty partitions and chunks; session skips zero-row and sub-`min_batch_size` batches. |
+| Ragged and empty batches | Slices never cross chunks and cover each chunk exactly; `batch_size=None` gives one batch per chunk; empty partitions and chunks; session skips zero-row and sub-`min_batch_size` batches. |
 | No duplicated or dropped rows | For `num_workers` in {0, 2} × simulated `world_size` in {1, 2} (explicit `rank=`), the union of `_index` equals the catalog's rows exactly once; same across multiple epochs; per-epoch reshuffle differs but stays complete; same seed reproduces the same order. |
 | Session runs and checkpoints | Loss decreases on a linear problem; periodic and final checkpoints exist and reload; `stop()` ends iteration; `close()` is idempotent; `process()` after close raises; `resume_from` restores counters. |
 | Inference index alignment | Non-trivial layout: many small partitions, a `.query` that empties some partitions, and `partitions[...]` reordering. Run on a 2-worker × 2-thread cluster with a deterministic linear model (`pred = 2*mag + 1`), then compare row by row and by `id` against an eager torch computation. Includes a test where the model returns the wrong row count and must fail. |
@@ -646,3 +660,31 @@ Each step is a feature branch off `dev` with a PR into `dev`:
 2. `feature/training`: `data/*`, `training/*` and `backends/*` (torch backend), tests,
    and an example script.
 3. `feature/inference`: `inference/*`, tests, and an example notebook.
+
+## 14. Upstream `CatalogStream` changes worth filing
+
+Rough shape of lsdb issues that would simplify lsdb-ml. Not filed; recorded for the
+maintainer.
+
+1. **Accept an explicit partition list/order.** `CatalogStream(catalog, partitions=[...])`
+   would replace the `catalog.partitions[idx]` sub-catalog workaround used for sharding.
+2. **`catalog.partitions[[3, 0, 5]]` silently re-sorts to pixel order.** Either preserve
+   the requested order or document that it does not.
+3. **Unshuffled order is reversed.** `get_next_partitions` pops from the tail, so
+   `shuffle=False` streams partitions last-to-first. Forward order would be less surprising.
+4. **Configurable prefetch depth.** Prefetch is fixed at one chunk; a `prefetch=` argument
+   would help hide fetch latency for slow (remote) partitions.
+5. **No overlap without a distributed client.** With `client=None` the next chunk is
+   computed inline *before* the current chunk is returned, which doubles latency for the
+   first chunk and gives no overlap afterwards. Returning first and computing lazily, or
+   using a background thread, would help single-process use.
+6. **Built-in sharding.** `shard_id`/`num_shards` arguments (disjoint, covering partition
+   assignment from a shared seed) would let any torch consumer shard correctly.
+7. **Epoch-aware infinite streaming.** `InfiniteStream` draws chunks with replacement
+   across chunks. An epoch-cycling mode (reshuffle per pass, no replacement within a pass)
+   is shardable and has exact coverage per pass.
+8. **Better mixing.** An optional cross-chunk row shuffle buffer inside the stream, since
+   HEALPix chunks are spatially coherent.
+9. **`CatalogIterator.__len__`** excludes the in-flight chunk, so it under-counts by one
+   after the first `next()`.
+
