@@ -17,6 +17,8 @@ classifiers = [
 dynamic = ["version"]
 requires-python = ">=3.11"
 dependencies = [
+    "lsdb>=0.11.0", # Brings nested-pandas, pyarrow and dask[complete] (incl. distributed)
+    "torch>=2.4",
 ]
 
 [project.urls]
