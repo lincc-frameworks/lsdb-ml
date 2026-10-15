@@ -687,4 +687,30 @@ maintainer.
    HEALPix chunks are spatially coherent.
 9. **`CatalogIterator.__len__`** excludes the in-flight chunk, so it under-counts by one
    after the first `next()`.
+10. **`catalog.partitions[[]]` raises** (`ValueError` from `PixelSearch`) instead of
+    returning an empty catalog, so callers must special-case empty selections.
+11. **Scheduler choice when `client=None`.** The stream then computes with whatever
+    global Dask scheduler is configured. In a forked DataLoader worker that can be a
+    parent's distributed client, which does not work in the child. lsdb-ml forces the
+    synchronous scheduler inside workers; a `scheduler=` argument on `CatalogStream`
+    would make that explicit.
+
+## 15. Implementation notes (differences from the sections above)
+
+Recorded while implementing; the PRs carry the code.
+
+- **No separate `backends/` package.** The seam is three small pieces instead: the
+  `TrainStep` protocol (training), `ModelSpec.factory` plus weights (model construction),
+  and the `inputs=` argument (how a batch becomes model arguments). A Hyrax backend would
+  supply a `TrainStep`, a factory and an `inputs` callable. A bundling `Backend` class can
+  be added if Hyrax needs one; with only the torch path it would have no behavior.
+- **`batching.py` folded into `data/dataset.py`** as `iter_slices`, since batching is now
+  a few lines (review decision 2). There is no `drop_last`; use `min_batch_size`.
+- **No `id_column` option.** `Flat("object_id", dtype=torch.int64)` does the same thing.
+- **No `as_list` output columns yet.** `(B, k)` outputs map to `k` named columns.
+- **`PartitionSource.iter_chunks(partitions, shuffle, seed)`.** The source receives the
+  partition indices; shard assignment lives in the dataset so every source shares it.
+- **Output columns are built with `pd.Series(values, dtype=d).array`** and assigned
+  positionally. `pd.array(values, "float32")` produces a nullable `Float32` column,
+  which would silently differ from a numpy `float32` meta.
 
