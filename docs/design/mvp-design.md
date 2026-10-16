@@ -85,7 +85,10 @@ with ModelDeployment(ModelSpec(MyModel, weights="model.pt")) as deployed:
 - **Batch-level padding is always correct, but has two costs.**
   - *Width follows the longest row.* One very long light curve makes its whole batch that
     wide, so memory and compute scale with `B × L_max` per batch. `max_length` with
-    `truncate` caps this.
+    `truncate` caps this. Both take one value for every nested input, or a mapping per nested
+    column for multi-modal catalogs, e.g. `max_length={"lc_g": 200, "spectrum": 4000}` and
+    `truncate={"lc_g": "tail", "spectrum": "head"}`. Keys are nested column names, not
+    dotted sub-column names, because a column's sub-columns share one mask.
   - *Width varies from batch to batch.* Models must accept a variable `L`. That's natural
     for sequence models and pooling, but a model that needs a fixed `L` (e.g. an MLP over a
     flattened sequence) isn't supported yet. A fixed-width padding option (`pad_to`, or a

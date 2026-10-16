@@ -20,7 +20,7 @@ become int64 and boolean columns stay bool.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,6 +30,8 @@ import torch
 from nested_pandas.series.dtype import NestedDtype
 
 from lsdb_ml.collate import TruncatePolicy, frame_to_array, pad_ragged
+
+_TRUNCATE_POLICIES = ("raise", "head", "tail")
 
 MASK_SUFFIX = "._mask"
 LENGTHS_SUFFIX = "._lengths"
@@ -84,12 +86,13 @@ class InputPlan:
         flat: list[_Column],
         nested: dict[str, list[_Column]],
         float_dtype: torch.dtype,
-        max_length: int | None,
-        truncate: TruncatePolicy,
+        max_length: dict[str, int | None],
+        truncate: dict[str, TruncatePolicy],
     ):
         self.flat = flat
         self.nested = nested
         self.float_dtype = float_dtype
+        #: Per nested column: longest sequence to keep (None for no limit), and the policy.
         self.max_length = max_length
         self.truncate = truncate
 
@@ -122,8 +125,8 @@ class InputPlan:
         Raises
         ------
         ValueError
-            If a value is missing, or a nested row is longer than ``max_length`` with
-            ``truncate="raise"``.
+            If a value is missing, or a nested row is longer than its column's
+            ``max_length`` with ``truncate="raise"``.
         """
         batch: dict[str, torch.Tensor] = {}
         for column in self.flat:
@@ -143,7 +146,11 @@ class InputPlan:
                     flat_values[[sub.name]], _numpy_dtype(sub.kind, self.float_dtype), repr(key)
                 )
                 padded, mask, kept = pad_ragged(
-                    values, lengths, max_length=self.max_length, truncate=self.truncate, what=repr(key)
+                    values,
+                    lengths,
+                    max_length=self.max_length[parent],
+                    truncate=self.truncate[parent],
+                    what=repr(key),
                 )
                 batch[key] = torch.from_numpy(np.ascontiguousarray(padded[..., 0]))
             batch[parent + MASK_SUFFIX] = torch.from_numpy(mask)
@@ -155,13 +162,44 @@ def _numpy_dtype(kind: str, float_dtype: torch.dtype) -> np.dtype:
     return torch.empty(0, dtype=_torch_dtype(kind, float_dtype)).numpy().dtype
 
 
+def _valid_max_length(value) -> bool:
+    return value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 1)
+
+
+def _per_column(option, value, default, nested_columns, valid, describe, problems) -> dict:
+    """Expand a single value or a ``{nested column: value}`` mapping to every nested input."""
+    if not isinstance(value, Mapping):
+        if not valid(value):
+            problems.append(f"{option} must be {describe}, got {value!r}.")
+        return dict.fromkeys(nested_columns, value)
+    resolved = dict.fromkeys(nested_columns, default)
+    for key, item in value.items():
+        parent = str(key).partition(".")[0]
+        if key in nested_columns:
+            if valid(item):
+                resolved[key] = item
+            else:
+                problems.append(f"{option}['{key}'] must be {describe}, got {item!r}.")
+        elif parent in nested_columns:
+            problems.append(
+                f"{option} key '{key}': use the nested column name '{parent}'; its sub-columns share "
+                "one mask, so they are truncated together."
+            )
+        else:
+            problems.append(
+                f"{option} key '{key}' is not a nested column among the inputs "
+                f"(nested inputs: {sorted(nested_columns)})."
+            )
+    return resolved
+
+
 def plan_inputs(
     schema,
     inputs: str | Sequence[str],
     *,
     float_dtype: torch.dtype = torch.float32,
-    max_length: int | None = None,
-    truncate: TruncatePolicy = "raise",
+    max_length: int | Mapping[str, int] | None = None,
+    truncate: TruncatePolicy | Mapping[str, TruncatePolicy] = "raise",
 ) -> InputPlan:
     """Check input column names against a catalog's schema, without computing data.
 
@@ -173,11 +211,15 @@ def plan_inputs(
         Column names: ``"mag"`` for a flat column, ``"lc.flux"`` for a nested sub-column.
     float_dtype : torch.dtype, default torch.float32
         Dtype for floating-point columns.
-    max_length : int, optional
-        Longest nested sequence to keep; see ``truncate``.
-    truncate : {"raise", "head", "tail"}, default "raise"
+    max_length : int or Mapping[str, int], optional
+        Longest nested sequence to keep; see ``truncate``. An int applies to every nested
+        input. A mapping sets it per nested column, keyed by the column name (``"lc"``,
+        not ``"lc.flux"``, since sub-columns share one mask); unlisted columns have no
+        limit.
+    truncate : {"raise", "head", "tail"} or Mapping[str, str], default "raise"
         For nested rows longer than ``max_length``: raise, keep the first values, or keep
-        the last values.
+        the last values. A mapping sets it per nested column, like ``max_length``;
+        unlisted columns use "raise".
 
     Returns
     -------
@@ -210,12 +252,6 @@ def plan_inputs(
     problems: list[str] = []
     if not names:
         problems.append("No input columns were given.")
-    if truncate not in ("raise", "head", "tail"):
-        problems.append(f"truncate must be 'raise', 'head' or 'tail', got {truncate!r}.")
-    if max_length is not None and (
-        isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 1
-    ):
-        problems.append(f"max_length must be a positive integer, got {max_length!r}.")
     if float_dtype not in (torch.float16, torch.float32, torch.float64):
         problems.append(f"float_dtype must be torch.float16, float32 or float64, got {float_dtype}.")
 
@@ -249,6 +285,19 @@ def plan_inputs(
         else:
             nested.setdefault(parent, []).append(_Column(sub, _kind(meta.dtypes[parent].column_dtypes[sub])))
 
+    lengths_limits = _per_column(
+        "max_length", max_length, None, nested, _valid_max_length, "a positive integer or None", problems
+    )
+    policies = _per_column(
+        "truncate",
+        truncate,
+        "raise",
+        nested,
+        lambda v: v in _TRUNCATE_POLICIES,
+        "'raise', 'head' or 'tail'",
+        problems,
+    )
+
     for parent, subs in nested.items():
         for suffix in (MASK_SUFFIX, LENGTHS_SUFFIX):
             if any(f"{parent}.{sub.name}" == parent + suffix for sub in subs):
@@ -261,4 +310,4 @@ def plan_inputs(
         if any("is not a column" in p for p in problems) and getattr(schema, "all_columns", None) is not None:
             hint = f"\nThe catalog was loaded with columns {list(meta.columns)}; others may exist on disk."
         raise InputError("Input columns do not match the catalog:\n  - " + "\n  - ".join(problems) + hint)
-    return InputPlan(flat, nested, float_dtype, max_length, truncate)
+    return InputPlan(flat, nested, float_dtype, lengths_limits, policies)

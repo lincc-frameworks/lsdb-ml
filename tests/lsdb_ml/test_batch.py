@@ -179,3 +179,73 @@ def test_pad_ragged_length_mismatch():
     """Inconsistent lengths and values are rejected."""
     with pytest.raises(ValueError, match="lengths sum to 3"):
         pad_ragged(np.zeros((2, 1)), np.array([1, 2]))
+
+
+# Several nested columns
+
+
+@pytest.fixture(scope="module")
+def two_nested(nested_frame):
+    """The test frame plus a second nested column ("spec") with longer rows (10-29 values)."""
+    rng = np.random.default_rng(1)
+    lengths = rng.integers(10, 30, len(nested_frame))
+    spec = pd.DataFrame(
+        {"wave": rng.uniform(4000, 9000, lengths.sum()), "flux": rng.normal(0, 1, lengths.sum())},
+        index=np.repeat(nested_frame.index, lengths),
+    )
+    return nested_frame.join_nested(spec, "spec")
+
+
+def test_per_column_max_length_and_truncate(two_nested):
+    """max_length and truncate can be set per nested column, keyed by column name."""
+    plan = plan_inputs(
+        two_nested,
+        ["lc.t", "lc.flux", "spec.wave"],
+        float_dtype=torch.float64,
+        max_length={"lc": 2, "spec": 12},
+        truncate={"lc": "head", "spec": "tail"},
+    )
+    batch = plan.to_tensors(two_nested)
+    for column, sub, width, keep in [("lc", "t", 2, "head"), ("spec", "wave", 12, "tail")]:
+        expected, expected_mask = reference_pad(reference_rows(two_nested, column, sub), width, keep=keep)
+        np.testing.assert_allclose(batch[f"{column}.{sub}"].numpy(), expected)
+        np.testing.assert_array_equal(batch[f"{column}._mask"].numpy(), expected_mask)
+    # Sub-columns of one nested column are truncated together and share the mask.
+    assert batch["lc.flux"].shape == batch["lc.t"].shape == batch["lc._mask"].shape
+
+
+def test_unlisted_columns_are_unlimited(two_nested):
+    """Columns missing from the max_length mapping keep every value."""
+    batch = plan_inputs(
+        two_nested, ["lc.t", "spec.wave"], max_length={"spec": 12}, truncate="tail"
+    ).to_tensors(two_nested)
+    assert batch["spec.wave"].shape[1] == 12
+    assert batch["lc.t"].shape[1] == int(np.asarray(two_nested["lc"].nest.len()).max())
+
+
+def test_single_value_applies_to_every_nested_column(two_nested):
+    """An int max_length and a single policy apply to all nested inputs."""
+    batch = plan_inputs(two_nested, ["lc.t", "spec.wave"], max_length=3, truncate="head").to_tensors(
+        two_nested
+    )
+    assert batch["lc.t"].shape[1] == batch["spec.wave"].shape[1] == 3
+
+
+def test_per_column_key_errors(two_nested):
+    """Mapping keys must be nested input columns; dotted keys get a hint; values are checked."""
+    with pytest.raises(InputError) as err:
+        plan_inputs(
+            two_nested,
+            ["lc.t", "spec.wave"],
+            max_length={"lc.t": 5, "lcc": 5, "spec": 0},
+            truncate={"lc": "middle", "mag": "head"},
+        )
+    message = str(err.value)
+    for expected in [
+        "max_length key 'lc.t': use the nested column name 'lc'",
+        "max_length key 'lcc' is not a nested column among the inputs",
+        "max_length['spec'] must be a positive integer",
+        "truncate['lc'] must be 'raise', 'head' or 'tail'",
+        "truncate key 'mag' is not a nested column among the inputs",
+    ]:
+        assert expected in message

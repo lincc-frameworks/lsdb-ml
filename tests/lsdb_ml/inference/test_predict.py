@@ -118,6 +118,40 @@ def test_forward_adapter(client, nested_catalog):
     np.testing.assert_allclose(result["pred"], 2 * result["mag"].astype(np.float64) + 1, rtol=1e-6)
 
 
+def test_per_column_max_length(client, nested_frame):
+    """predict passes per-column limits through: each nested input is truncated separately."""
+    import lsdb
+
+    rng = np.random.default_rng(2)
+    lengths = rng.integers(10, 30, len(nested_frame))
+    spec = pd.DataFrame(
+        {"flux": rng.normal(0, 1, lengths.sum())}, index=np.repeat(nested_frame.index, lengths)
+    )
+    catalog = lsdb.from_dataframe(nested_frame.join_nested(spec, "spec"), partition_rows=100)
+
+    def widths(model, batch):
+        rows = batch["mag"].shape[0]
+        return torch.stack(
+            [
+                torch.full((rows,), batch["lc.flux"].shape[1]),
+                torch.full((rows,), batch["spec.flux"].shape[1]),
+            ],
+            dim=1,
+        )
+
+    result = predict(
+        catalog,
+        nn.Identity(),
+        ["mag", "lc.flux", "spec.flux"],
+        {"lc_width": "int64", "spec_width": "int64"},
+        forward=widths,
+        max_length={"lc": 2, "spec": 12},
+        truncate="tail",
+        append=False,
+    ).compute(progress_bar=False)
+    assert result["lc_width"].max() <= 2 and result["spec_width"].max() == 12
+
+
 def test_multi_column_output(client, nested_catalog):
     """A (B, k) output fills k columns in order."""
     result = predict(nested_catalog, Stacked(), MAG_INPUTS, ["plus", "minus"], append=False).compute(

@@ -89,8 +89,8 @@ class ModelDeployment:
         batch_size: int = 4096,
         append: bool = True,
         float_dtype: torch.dtype = torch.float32,
-        max_length: int | None = None,
-        truncate: TruncatePolicy = "raise",
+        max_length: int | Mapping[str, int] | None = None,
+        truncate: TruncatePolicy | Mapping[str, TruncatePolicy] = "raise",
     ):
         """Return a lazy catalog with the model's predictions for every row.
 
@@ -146,8 +146,8 @@ def predict(
     batch_size: int = 4096,
     append: bool = True,
     float_dtype: torch.dtype = torch.float32,
-    max_length: int | None = None,
-    truncate: TruncatePolicy = "raise",
+    max_length: int | Mapping[str, int] | None = None,
+    truncate: TruncatePolicy | Mapping[str, TruncatePolicy] = "raise",
     client=None,
 ):
     """Run a model over every row of a catalog, returning a lazy catalog of predictions.
@@ -184,12 +184,16 @@ def predict(
         same index).
     float_dtype : torch.dtype, default torch.float32
         Dtype for floating-point input columns.
-    max_length : int, optional
+    max_length : int or Mapping[str, int], optional
         Longest nested sequence to keep; see ``truncate``. Nested inputs are padded to the
         longest row in each batch, so one very long row makes the whole batch that wide.
-    truncate : {"raise", "head", "tail"}, default "raise"
+        An int applies to every nested input; a mapping sets it per nested column, keyed
+        by column name, e.g. ``{"lc_g": 200, "spectrum": 4000}`` (unlisted columns have no
+        limit).
+    truncate : {"raise", "head", "tail"} or Mapping[str, str], default "raise"
         For nested rows longer than ``max_length``: raise, keep the first values, or keep
-        the last values.
+        the last values. A mapping sets it per nested column; unlisted columns use
+        "raise".
     client : distributed.Client, optional
         Client to deploy to. Defaults to the active client; one is required.
 
