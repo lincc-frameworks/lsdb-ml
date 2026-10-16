@@ -17,7 +17,7 @@ import torch
 from distributed import Client, LocalCluster
 from torch import nn
 
-from lsdb_ml import ColumnSpec, Flat, ModelDeployment, ModelSpec, Nested
+from lsdb_ml import ModelDeployment, ModelSpec
 
 
 def make_catalog(n_objects=5000, seed=0):
@@ -46,8 +46,10 @@ class Scorer(nn.Module):
         super().__init__()
         self.head = nn.Linear(2, 2)
 
-    def forward(self, mag, flux, mask):
+    def forward(self, batch):
         """Return two scores per object from the magnitude and the mean light-curve flux."""
+        # Batches are keyed by column name; nested sub-columns share a "<column>._mask".
+        mag, flux, mask = batch["mag"], batch["lc.flux"], batch["lc._mask"]
         mean_flux = (flux * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         return self.head(torch.stack([mag, mean_flux], dim=1))
 
@@ -58,15 +60,14 @@ def main(weights_path):
     torch.save(Scorer().state_dict(), weights_path)  # stands in for a trained model
 
     catalog = make_catalog().query("mag < 21")  # any lazy lsdb pipeline works here
-    spec = ColumnSpec({"mag": Flat("mag"), "flux": Nested("lc", "flux", max_length=32, truncate="tail")})
-
-    # Workers build Scorer() and load the weights themselves; only the spec is shipped.
+    # Workers build Scorer() and load the weights themselves; only the factory and path are shipped.
     with ModelDeployment(ModelSpec(Scorer, weights=weights_path, device="cpu")) as deployed:
         scored = deployed.predict(
             catalog,
-            spec,
+            inputs=["mag", "lc.flux"],  # flat vs nested is read from the catalog's meta
             outputs={"score_a": "float32", "score_b": "float32"},
-            inputs=["mag", "flux", "flux_mask"],
+            max_length=32,  # keep at most the last 32 observations per light curve
+            truncate="tail",
             batch_size=1024,
         )
         print(scored.dtypes[["object_id", "mag", "score_a", "score_b"]])  # meta, nothing computed yet

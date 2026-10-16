@@ -1,21 +1,17 @@
 from ._version import __version__
+from .batch import InputError, InputPlan, plan_inputs
 from .device import move_batch, resolve_device
 from .example_module import greetings, meaning
 from .inference import ModelDeployment, ModelSpec, OutputSpec, predict
-from .spec import ColumnSpec, Field, Flat, Nested, ResolvedSpec, SpecError, TensorInfo
 
 __all__ = [
-    "ColumnSpec",
-    "Field",
-    "Flat",
-    "Nested",
-    "ResolvedSpec",
-    "SpecError",
-    "TensorInfo",
+    "predict",
     "ModelDeployment",
     "ModelSpec",
     "OutputSpec",
-    "predict",
+    "InputError",
+    "InputPlan",
+    "plan_inputs",
     "move_batch",
     "resolve_device",
     "greetings",

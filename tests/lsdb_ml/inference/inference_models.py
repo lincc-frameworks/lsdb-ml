@@ -4,8 +4,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from lsdb_ml import ColumnSpec, Flat
-
 # Counts factory calls; with processes=False every worker shares this module.
 BUILDS = {"count": 0}
 
@@ -15,14 +13,14 @@ class AffineMag(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.linear = nn.Linear(1, 1, dtype=torch.float64)
+        self.linear = nn.Linear(1, 1)
         with torch.no_grad():
             self.linear.weight.fill_(2.0)
             self.linear.bias.fill_(1.0)
 
-    def forward(self, mag):
-        """Map (B,) magnitudes to (B,) predictions."""
-        return self.linear(mag.unsqueeze(-1)).squeeze(-1)
+    def forward(self, batch):
+        """Map the (B,) "mag" tensor to (B,) predictions."""
+        return self.linear(batch["mag"].unsqueeze(-1)).squeeze(-1)
 
 
 def counting_factory():
@@ -34,28 +32,29 @@ def counting_factory():
 class MaskedMean(nn.Module):
     """Mean of the real (unpadded) light-curve values; 0 for empty light curves."""
 
-    def forward(self, flux, mask):
+    def forward(self, batch):
         """Average padded values using the mask."""
+        flux, mask = batch["lc.flux"], batch["lc._mask"]
         return (flux * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
 
 class Stacked(nn.Module):
     """Two outputs per row, as a (B, 2) tensor."""
 
-    def forward(self, mag):
+    def forward(self, batch):
         """Return [mag, -mag]."""
-        return torch.stack([mag, -mag], dim=1)
+        return torch.stack([batch["mag"], -batch["mag"]], dim=1)
 
 
 class DropsRow(nn.Module):
     """A broken model that returns one prediction too few."""
 
-    def forward(self, mag):
+    def forward(self, batch):
         """Drop the last row."""
-        return mag[:-1]
+        return batch["mag"][:-1]
 
 
-MAG_SPEC = ColumnSpec({"mag": Flat("mag", dtype=torch.float64)})
+MAG_INPUTS = "mag"
 
 
 def check_alignment(result, source_frame):

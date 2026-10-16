@@ -5,7 +5,7 @@ import torch
 from distributed import Client, LocalCluster
 from inference_models import (
     BUILDS,
-    MAG_SPEC,
+    MAG_INPUTS,
     AffineMag,
     DropsRow,
     MaskedMean,
@@ -13,8 +13,9 @@ from inference_models import (
     check_alignment,
     counting_factory,
 )
+from torch import nn
 
-from lsdb_ml import ColumnSpec, Flat, ModelDeployment, ModelSpec, Nested, OutputSpec, predict
+from lsdb_ml import InputError, ModelDeployment, ModelSpec, OutputSpec, predict
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +42,7 @@ def test_index_aligned_after_nontrivial_layout(client, scrambled_catalog, nested
     assert 0 in [len(p.compute(progress_bar=False)) for p in scrambled_catalog.partitions]
 
     with ModelDeployment(ModelSpec(AffineMag)) as deployed:
-        lazy = deployed.predict(scrambled_catalog, MAG_SPEC, {"pred": "float64"}, batch_size=3)
+        lazy = deployed.predict(scrambled_catalog, MAG_INPUTS, {"pred": "float64"}, batch_size=3)
         result = lazy.compute(progress_bar=False)
     assert len(result) == len(computed_input)
     assert result.index.equals(computed_input.index)
@@ -56,7 +57,7 @@ def test_alignment_with_duplicate_index(client, nested_frame):
     frame["ra"] = 10.0  # every object at the same position: one index value repeated
     frame["dec"] = 10.0
     catalog = lsdb.from_dataframe(frame, partition_rows=100)
-    result = predict(catalog, AffineMag(), MAG_SPEC, {"pred": "float64"}, batch_size=7).compute(
+    result = predict(catalog, AffineMag(), MAG_INPUTS, {"pred": "float64"}, batch_size=7).compute(
         progress_bar=False
     )
     assert not result.index.is_unique
@@ -68,10 +69,10 @@ def test_model_loaded_once_per_worker(client, nested_catalog):
     BUILDS["count"] = 0
     spec = ModelSpec(counting_factory)
     with ModelDeployment(spec) as deployed:
-        deployed.predict(nested_catalog, MAG_SPEC, {"pred": "float64"}).compute(progress_bar=False)
-        deployed.predict(nested_catalog, MAG_SPEC, {"pred": "float64"}).compute(progress_bar=False)
+        deployed.predict(nested_catalog, MAG_INPUTS, {"pred": "float64"}).compute(progress_bar=False)
+        deployed.predict(nested_catalog, MAG_INPUTS, {"pred": "float64"}).compute(progress_bar=False)
         # Deploying the same spec again reuses the installed plugin.
-        predict(nested_catalog, spec, MAG_SPEC, {"pred": "float64"}).compute(progress_bar=False)
+        predict(nested_catalog, spec, MAG_INPUTS, {"pred": "float64"}).compute(progress_bar=False)
     assert nested_catalog.npartitions > len(client.scheduler_info()["workers"])
     assert BUILDS["count"] == len(client.scheduler_info()["workers"]) == 2
 
@@ -79,7 +80,7 @@ def test_model_loaded_once_per_worker(client, nested_catalog):
 def test_meta_matches_computed(client, nested_catalog):
     """The lazy result's meta has the same columns and dtypes as the computed data."""
     for append in (True, False):
-        lazy = predict(nested_catalog, AffineMag(), MAG_SPEC, {"pred": "float32"}, append=append)
+        lazy = predict(nested_catalog, AffineMag(), MAG_INPUTS, {"pred": "float32"}, append=append)
         computed = lazy.compute(progress_bar=False)
         assert list(lazy.columns) == list(computed.columns)
         assert lazy.dtypes.to_dict() == computed.dtypes.to_dict()
@@ -89,14 +90,13 @@ def test_meta_matches_computed(client, nested_catalog):
 
 
 def test_nested_inputs(client, nested_catalog):
-    """Nested columns are padded and masked, so a masked mean matches a per-row mean."""
-    spec = ColumnSpec({"flux": Nested("lc", "flux", dtype=torch.float64)})
+    """Nested sub-columns arrive padded with a shared mask, so a masked mean matches a per-row mean."""
     result = predict(
         nested_catalog,
         MaskedMean(),
-        spec,
+        "lc.flux",
         {"mean_flux": "float64"},
-        inputs=["flux", "flux_mask"],
+        float_dtype=torch.float64,
         batch_size=9,
     ).compute(progress_bar=False)
     expected = [
@@ -106,9 +106,21 @@ def test_nested_inputs(client, nested_catalog):
     np.testing.assert_allclose(result["mean_flux"].to_numpy(), expected, rtol=1e-6)
 
 
+def test_forward_adapter(client, nested_catalog):
+    """forward= adapts models that take positional tensors instead of the batch dict."""
+    result = predict(
+        nested_catalog,
+        nn.Identity(),
+        ["mag", "lc.flux"],
+        {"pred": "float64"},
+        forward=lambda model, batch: 2 * model(batch["mag"]) + 1,
+    ).compute(progress_bar=False)
+    np.testing.assert_allclose(result["pred"], 2 * result["mag"].astype(np.float64) + 1, rtol=1e-6)
+
+
 def test_multi_column_output(client, nested_catalog):
     """A (B, k) output fills k columns in order."""
-    result = predict(nested_catalog, Stacked(), MAG_SPEC, ["plus", "minus"], append=False).compute(
+    result = predict(nested_catalog, Stacked(), MAG_INPUTS, ["plus", "minus"], append=False).compute(
         progress_bar=False
     )
     np.testing.assert_allclose(result["plus"], -result["minus"])
@@ -116,7 +128,7 @@ def test_multi_column_output(client, nested_catalog):
 
 def test_wrong_row_count_fails(client, nested_catalog):
     """A model that drops rows fails loudly instead of misaligning predictions."""
-    lazy = predict(nested_catalog, DropsRow(), MAG_SPEC, {"pred": "float32"})
+    lazy = predict(nested_catalog, DropsRow(), MAG_INPUTS, {"pred": "float32"})
     with pytest.raises(Exception, match="exactly one prediction per input row"):
         lazy.compute(progress_bar=False)
 
@@ -124,13 +136,13 @@ def test_wrong_row_count_fails(client, nested_catalog):
 def test_validation(client, unloadable_catalog):
     """Bad specs, outputs and arguments fail before any data is read."""
     with pytest.raises(ValueError, match="already exist"):
-        predict(unloadable_catalog, AffineMag(), MAG_SPEC, {"mag": "float32"})
-    with pytest.raises(ValueError, match="pass inputs="):
-        predict(unloadable_catalog, AffineMag(), ColumnSpec({"a": Flat("ra"), "b": Flat("dec")}), ["p"])
-    with pytest.raises(ValueError, match="not in the catalog"):
-        predict(unloadable_catalog, AffineMag(), ColumnSpec({"a": Flat("nope")}), ["p"])
+        predict(unloadable_catalog, AffineMag(), MAG_INPUTS, {"mag": "float32"})
+    with pytest.raises(InputError, match="'nope' is not a column"):
+        predict(unloadable_catalog, AffineMag(), ["mag", "nope"], ["p"])
+    with pytest.raises(TypeError, match="forward must be callable"):
+        predict(unloadable_catalog, AffineMag(), MAG_INPUTS, ["p"], forward="mag")
     with pytest.raises(ValueError, match="batch_size"):
-        predict(unloadable_catalog, AffineMag(), MAG_SPEC, ["p"], batch_size=0)
+        predict(unloadable_catalog, AffineMag(), MAG_INPUTS, ["p"], batch_size=0)
     with pytest.raises(TypeError, match="ModelSpec or torch.nn.Module"):
         ModelDeployment("model")
 
@@ -138,13 +150,13 @@ def test_validation(client, unloadable_catalog):
 def test_closed_deployment(client, nested_catalog):
     """After close, the model is gone from the workers and computing fails clearly."""
     deployed = ModelDeployment(ModelSpec(AffineMag, device="cpu", torch_threads=None))
-    lazy = deployed.predict(nested_catalog, MAG_SPEC, {"pred": "float32"})
+    lazy = deployed.predict(nested_catalog, MAG_INPUTS, {"pred": "float32"})
     deployed.close()
     deployed.close()
     with pytest.raises(Exception, match="is not deployed"):
         lazy.compute(progress_bar=False)
     with pytest.raises(RuntimeError, match="closed"):
-        deployed.predict(nested_catalog, MAG_SPEC, {"pred": "float32"})
+        deployed.predict(nested_catalog, MAG_INPUTS, {"pred": "float32"})
 
 
 def test_weights_loaded_on_workers(client, nested_catalog, tmp_path):
@@ -154,7 +166,7 @@ def test_weights_loaded_on_workers(client, nested_catalog, tmp_path):
         trained.linear.bias.fill_(5.0)
     torch.save(trained.state_dict(), tmp_path / "state.pt")
     spec = ModelSpec(AffineMag, weights=tmp_path / "state.pt")
-    result = predict(nested_catalog, spec, MAG_SPEC, {"pred": "float64"}).compute(progress_bar=False)
+    result = predict(nested_catalog, spec, MAG_INPUTS, {"pred": "float64"}).compute(progress_bar=False)
     np.testing.assert_allclose(result["pred"], 2 * result["mag"].astype(np.float64) + 5, rtol=1e-6)
 
 

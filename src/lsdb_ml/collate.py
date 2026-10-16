@@ -1,7 +1,7 @@
 """Vectorized conversion of (nested) dataframe columns into padded numpy arrays.
 
-These helpers do the numeric work behind :class:`lsdb_ml.Flat` and :class:`lsdb_ml.Nested`.
-Nothing here loops over rows in Python.
+These helpers do the numeric work behind :func:`lsdb_ml.batch.plan_inputs`. Nothing here
+loops over rows in Python.
 """
 
 from __future__ import annotations
@@ -10,38 +10,8 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-import torch
 
 TruncatePolicy = Literal["raise", "head", "tail"]
-
-
-def numpy_dtype(dtype: torch.dtype) -> np.dtype:
-    """Return the numpy dtype that corresponds to a torch dtype.
-
-    Parameters
-    ----------
-    dtype : torch.dtype
-        A torch dtype with a numpy equivalent.
-
-    Returns
-    -------
-    np.dtype
-        The matching numpy dtype.
-
-    Raises
-    ------
-    TypeError
-        If the torch dtype has no numpy equivalent (e.g. ``torch.bfloat16``).
-
-    Examples
-    --------
-    >>> numpy_dtype(torch.float32)
-    dtype('float32')
-    """
-    try:
-        return torch.empty(0, dtype=dtype).numpy().dtype
-    except TypeError as err:
-        raise TypeError(f"torch dtype {dtype} has no numpy equivalent and cannot be collated.") from err
 
 
 def frame_to_array(frame: pd.DataFrame, dtype: np.dtype, what: str) -> np.ndarray:
