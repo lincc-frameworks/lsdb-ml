@@ -6,9 +6,17 @@ from hyrax.datasets.dataset_registry import HyraxDataset
 
 
 def create_meta_dict(nested_frame):
+    """Convert the metadata of a nested dataframe or LSDB catalog instance into
+    dictionary that can be used by the DataframeDataset class"""
     meta_dict = {}
-    cols = nested_frame._operation.meta.columns
-    nested_cols = nested_frame._operation.meta.nested_columns
+
+    # This allows a user to pass either the nestedframe or just the metadata
+    if isinstance(nested_frame, npd.NestedFrame):
+        cols = nested_frame.columns
+        nested_cols = nested_frame.nested_columns
+    else:  # assume it's an LSDB catalog instance
+        cols = nested_frame._operation.meta.columns
+        nested_cols = nested_frame._operation.meta.nested_columns
 
     non_nested_cols = [col for col in cols if col not in nested_cols]
 

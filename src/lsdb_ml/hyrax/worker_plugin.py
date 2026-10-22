@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import hyrax
+import lsdb
 import numpy as np
 import torch
 from distributed import Client, WorkerPlugin, get_worker
@@ -8,17 +10,22 @@ from hyrax.models.model_utils import load_model_weights
 from hyrax.plugin_utils import load_prepare_inputs
 from hyrax.pytorch_ignite import _auto_model, create_process_func, dist_data_loader, setup_dataset
 
+from lsdb_ml.hyrax.datasets.hyrax_dataframe_dataset import create_meta_dict
+
 DEFAULT_PLUGIN_NAME = "__hyrax_infer"
 
 
 class TorchModelPlugin(WorkerPlugin):
-    def __init__(self, name=DEFAULT_PLUGIN_NAME, config={}):
+    """Worker plugin that loads a Hyrax model and prepares it for inference."""
+
+    def __init__(self, name=DEFAULT_PLUGIN_NAME, config=None):
         self.name = name  # plugins are keyed by name on the worker
-        self.config = config
+        self.config = config or {}
         self.model = None
         self.dataset = None
 
     def setup(self, worker):
+        """Set up the worker by loading the Hyrax model and preparing it for inference."""
         model_cls = fetch_model_class(self.config)
         model = model_cls(self.config, None)
 
@@ -41,6 +48,7 @@ class TorchModelPlugin(WorkerPlugin):
         self.dataset = datasets["infer"]
 
     def teardown(self, worker):
+        """Tear down the worker by releasing the model and dataset."""
         self.model = None
 
 
@@ -74,6 +82,7 @@ def _predict_with_worker(df, process_fn, dataset, config):
 
 
 def predict(df, plugin_name=DEFAULT_PLUGIN_NAME):
+    """Predict using the Hyrax model registered with the worker plugin."""
     return _predict_with_worker(
         df,
         get_worker().plugins[plugin_name].process_fn,
@@ -82,5 +91,77 @@ def predict(df, plugin_name=DEFAULT_PLUGIN_NAME):
     )
 
 
-def register_hyrax_plugins(client: Client, config: dict, plugin_name: str = DEFAULT_PLUGIN_NAME):
-    client.register_plugin(TorchModelPlugin(plugin_name, config))
+def register_hyrax_plugins(
+    client: Client,
+    catalog: lsdb.Catalog = None,
+    config: dict = None,
+    id_field: str = "_healpix_29",
+    fields: list[str] | None = None,
+    plugin_name: str = DEFAULT_PLUGIN_NAME,
+):
+    """Prepares the Hyrax instance and registers the worker plugin with the Dask client.
+
+    This function sets up the Hyrax configuration, builds the data request for inference,
+    and registers the TorchModelPlugin with the specified client.
+
+    Parameters
+    ----------
+    client : Client
+        The Dask client to register the plugin with.
+    catalog : lsdb.Catalog, optional
+        The LSDB catalog to use for inference, by default None.
+    config : dict, optional
+        Configuration dictionary for Hyrax, by default None.
+    id_field : str, optional
+        The primary ID field in the catalog, by default "_healpix_29".
+    fields : list[str] | None, optional
+        List of fields to include in the inference dataset, by default None.
+    plugin_name : str, optional
+        Name of the plugin to register, by default DEFAULT_PLUGIN_NAME.
+
+    Raises
+    ------
+    ValueError
+        If the id_field is not specified or not present in the catalog.
+    """
+    if id_field is None:
+        raise ValueError("id_field must be specified")
+
+    # check if id_field is a column in the catalog
+    if catalog is not None and id_field not in catalog.columns:
+        raise ValueError(f"id_field '{id_field}' is not a column in the catalog")
+
+    # For this `config` to work, we need to update Hyrax so that it can accept a plain dictionary
+    if config is None:
+        config = {}
+    h = hyrax.Hyrax()
+
+    # call h.set_config("key.sub_key", value) for each key-value pair in the config dictionary
+    if config is not None:
+        for key, value in config.items():
+            for sub_key, sub_value in value.items():
+                h.set_config(f"{key}.{sub_key}", sub_value)
+
+    # Never use caching for inference
+    h.set_config("data_set.use_cache", False)
+
+    # Build the data request for inference
+    data = {
+        "dataset_class": "DataframeDataset",
+        "data_location": create_meta_dict(catalog),
+        "primary_id_field": id_field,
+    }
+
+    if fields is not None:
+        data["fields"] = fields
+
+    data_request = {"infer": {"data": data}}
+    h.config["data_request"] = data_request
+
+    # Ideally the user wouldn't have to pass `client``
+    # if client is None, dask could autodetect the client
+    from dask.distributed import get_client
+
+    if client is None:
+        client = get_client()
+    client.register_plugin(TorchModelPlugin(plugin_name, h.config))
