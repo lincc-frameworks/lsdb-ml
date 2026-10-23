@@ -17,6 +17,8 @@ classifiers = [
 dynamic = ["version"]
 requires-python = ">=3.11"
 dependencies = [
+    "lsdb",
+    "hyrax",
 ]
 
 [project.urls]
@@ -30,10 +32,6 @@ dev = [
     "pytest",
     "pytest-cov", # Used to report total code coverage
     "ruff", # Used for static linting of files
-]
-
-hyrax = [
-    "hyrax", # Needed for Hyrax-based WorkerPlugins
 ]
 
 # Command-line scripts that can be run after installing the package
