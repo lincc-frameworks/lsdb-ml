@@ -2,7 +2,9 @@ from pathlib import Path
 
 import hyrax
 import numpy as np
+import pandas as pd
 import torch
+from dask.distributed import get_client
 from distributed import Client, WorkerPlugin, get_worker
 from hyrax.models.model_registry import fetch_model_class
 from hyrax.models.model_utils import load_model_weights
@@ -48,6 +50,8 @@ class TorchModelPlugin(WorkerPlugin):
 
         # Build the function that is called that processes data
         device = torch.accelerator.current_accelerator()
+        if device is None:
+            device = torch.device("cpu")
         self.process_fn = create_process_func("infer_batch", device.type, self.model, self.config)
 
     def teardown(self, worker):
@@ -61,7 +65,7 @@ class TorchModelPlugin(WorkerPlugin):
         data = {
             "dataset_class": "DataframeDataset",
             "data_location": create_meta_dict(df),
-            "primary_id_field": primary_id_field,
+            "primary_id_field": primary_id_field,  # ^ can come from self.config???
         }
 
         # Include fields if provided, excluding uses _all_ available fields by default
@@ -121,7 +125,7 @@ def _predict_with_worker(df, process_fn, dataset, config, output_fields):
     return out
 
 
-def predict(
+def _predict(
     df,
     plugin_name: str = DEFAULT_PLUGIN_NAME,
     primary_id_field: str = "_healpix_29",
@@ -147,9 +151,10 @@ def predict(
     """
 
     # Prep dataset for inference on the first call, only instantiated once.
-    get_worker().plugins[plugin_name].prep_ml_dataset(
-        df=df, primary_id_field=primary_id_field, fields=input_fields
-    )
+    if not get_worker().plugins[plugin_name].dataset_prepped:
+        get_worker().plugins[plugin_name].prep_ml_dataset(
+            df=df, primary_id_field=primary_id_field, fields=input_fields
+        )
 
     return _predict_with_worker(
         df,
@@ -199,12 +204,47 @@ def register_hyrax_plugin(
     # Never use caching for inference
     h.set_config("data_set.use_cache", False)
 
-    # ^ Now that this is not a function that a user would call, but instead is called
-    # ^ by the `ml_client` context manager, can we safely assume that a Dask client
-    # ^ is available and remove the next 3 lines?
-    from dask.distributed import get_client
-
     if client is None:
         client = get_client()
 
     client.register_plugin(TorchModelPlugin(plugin_name, h.config))
+
+
+def predict(
+    df,
+    plugin_name: str = DEFAULT_PLUGIN_NAME,
+    primary_id_field: str = "_healpix_29",
+    input_fields: list = None,
+    output_fields: pd.DataFrame = None,
+):
+    """Main prediction function for the Hyrax worker plugin.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame containing the data to be used for prediction.
+    plugin_name : str, optional
+        Name of the plugin to use for prediction, by default DEFAULT_PLUGIN_NAME
+    primary_id_field : str, optional
+        Name of the primary ID field in the DataFrame, by default "_healpix_29"
+    input_fields : list, optional
+        List of input field names to be used for prediction, by default None
+    output_fields : pd.DataFrame, optional
+        DataFrame containing the output fields for prediction, by default None
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the prediction results.
+    """
+
+    meta = df._operation.meta.copy(deep=True).join(output_fields, how="left")
+
+    return df.map_partitions(
+        _predict,
+        plugin_name=plugin_name,
+        primary_id_field=primary_id_field,
+        input_fields=input_fields,
+        output_fields=output_fields,
+        meta=meta,
+    )
