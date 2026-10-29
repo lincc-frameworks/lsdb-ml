@@ -1,4 +1,6 @@
 from ._version import __version__
-from .example_module import greetings, meaning
+from .hyrax.client import ml_client
+from .hyrax.config_utils import ModelConfig
+from .hyrax.predict import predict
 
-__all__ = ["greetings", "meaning", "__version__"]
+__all__ = ["__version__", "ml_client", "predict", "ModelConfig"]
