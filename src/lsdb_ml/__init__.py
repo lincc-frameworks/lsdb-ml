@@ -1,6 +1,6 @@
 from ._version import __version__
 from .hyrax.client import ml_client
 from .hyrax.config_utils import ModelConfig
-from .hyrax.worker_plugin import predict
+from .hyrax.predict import predict
 
 __all__ = ["__version__", "ml_client", "predict", "ModelConfig"]
