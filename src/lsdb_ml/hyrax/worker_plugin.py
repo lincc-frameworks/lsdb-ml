@@ -200,12 +200,26 @@ def register_hyrax_plugin(
     client.register_plugin(TorchModelPlugin(plugin_name, model_config))
 
 
+def _get_output_fields(dask_worker, plugin_name):
+    """Run on each worker via `Client.run` to fetch the plugin's output fields.
+
+    Dask injects `dask_worker` because of the parameter name. Returns None if
+    the plugin is not registered on this worker.
+    """
+    plugin = dask_worker.plugins.get(plugin_name)
+    return None if plugin is None else plugin.model_config.output_fields
+
+
 def predict(
     df,
     plugin_name: str = DEFAULT_PLUGIN_NAME,
 ):
     """Main prediction function, should call `df.map_partitions(_predict)`
     internally.
+
+    The output schema is read from the `ModelConfig` of the plugin registered
+    on the workers of the default Dask client, so the plugin must be registered
+    (via `ml_client` or `register_hyrax_plugin`) before calling this.
 
     Parameters
     ----------
@@ -218,12 +232,24 @@ def predict(
     -------
     pd.DataFrame
         DataFrame containing the prediction results.
+
+    Raises
+    ------
+    ValueError
+        If the plugin is not registered on every worker of the default client.
     """
 
-    # ^ Having trouble getting the worker here.
-    output_fields = get_worker().plugins[plugin_name].model_config.output_fields
+    # `predict` runs on the client, so `get_worker()` is unavailable here.
+    # Instead, ask the workers for the output fields of the registered plugin.
+    results = get_client().run(_get_output_fields, plugin_name=plugin_name)
+    if not results or any(fields is None for fields in results.values()):
+        raise ValueError(
+            f"Plugin '{plugin_name}' is not registered on every worker. "
+            "Use `ml_client(...)` or `register_hyrax_plugin(...)` before calling `predict`."
+        )
+    output_fields = next(iter(results.values()))
 
-    meta = df._operation.meta.copy(deep=True).join(output_fields, how="left")
+    meta = df.meta.copy(deep=True).join(output_fields, how="left")
 
     return df.map_partitions(
         _predict,

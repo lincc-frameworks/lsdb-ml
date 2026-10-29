@@ -19,7 +19,7 @@ class ModelConfig:
         The output fields for the model.
     batch_size : int, optional
         The batch size for inference. Defaults to 64.
-    primary_field_id : str, optional
+    primary_id_field : str, optional
         The primary ID field. Defaults to "_healpix_29".
     input_fields : list, optional
         The input fields for the model. Defaults to None.
@@ -34,7 +34,7 @@ class ModelConfig:
 
     # Optional fields
     batch_size: int = 64
-    primary_field_id: str = "_healpix_29"
+    primary_id_field: str = "_healpix_29"
     input_fields: list = None
     hyrax_config_file: str = None
 
