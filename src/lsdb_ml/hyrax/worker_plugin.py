@@ -25,11 +25,7 @@ DEFAULT_PLUGIN_NAME = "__hyrax_infer"
 class TorchModelPlugin(WorkerPlugin):
     """Worker plugin that loads a Hyrax model and prepares it for inference."""
 
-    def __init__(
-            self,
-            name: str=DEFAULT_PLUGIN_NAME,
-            model_config: ModelConfig = None
-        ):
+    def __init__(self, name: str = DEFAULT_PLUGIN_NAME, model_config: ModelConfig = None):
         self.name = name  # plugins are keyed by name on the worker
         self.model_config = model_config
         self.model = None
