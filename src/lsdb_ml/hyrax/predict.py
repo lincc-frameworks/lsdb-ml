@@ -7,7 +7,7 @@ from hyrax.pytorch_ignite import (
     results_to_numpy,
 )
 
-from .worker_plugin import DEFAULT_PLUGIN_NAME
+from lsdb_ml.hyrax.worker_plugin import DEFAULT_PLUGIN_NAME
 
 
 def predict(
