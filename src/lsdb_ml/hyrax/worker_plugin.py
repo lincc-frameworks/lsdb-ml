@@ -2,7 +2,6 @@ from pathlib import Path
 
 import hyrax
 import numpy as np
-import pandas as pd
 import torch
 from dask.distributed import get_client
 from distributed import Client, WorkerPlugin, get_worker
@@ -17,6 +16,7 @@ from hyrax.pytorch_ignite import (
     setup_dataset,
 )
 
+from lsdb_ml.hyrax.config_utils import ModelConfig
 from lsdb_ml.hyrax.datasets.hyrax_dataframe_dataset import create_meta_dict
 
 DEFAULT_PLUGIN_NAME = "__hyrax_infer"
@@ -25,12 +25,29 @@ DEFAULT_PLUGIN_NAME = "__hyrax_infer"
 class TorchModelPlugin(WorkerPlugin):
     """Worker plugin that loads a Hyrax model and prepares it for inference."""
 
-    def __init__(self, name=DEFAULT_PLUGIN_NAME, config=None):
+    def __init__(
+            self,
+            name: str=DEFAULT_PLUGIN_NAME,
+            model_config: ModelConfig = None
+        ):
         self.name = name  # plugins are keyed by name on the worker
-        self.config = config or {}
+        self.model_config = model_config
         self.model = None
         self.dataset = None
         self.dataset_prepped = False
+
+        config_file = None
+        if model_config:
+            config_file = model_config.hyrax_config_file
+        h = hyrax.Hyrax(config_file=config_file)
+
+        # call h.set_config("key.sub_key", value) for each field mapping in ModelConfig.FIELD_MAPPING
+        for k, v in ModelConfig.FIELD_MAPPING.items():
+            h.set_config(v, getattr(model_config, k))
+
+        # Never use caching for inference
+        h.set_config("data_set.use_cache", False)
+        self.config = h.config
 
     def setup(self, worker):
         """Set up the worker by loading the Hyrax model and preparing it for inference."""
@@ -58,19 +75,19 @@ class TorchModelPlugin(WorkerPlugin):
         """Tear down the worker by releasing the model and dataset."""
         self.model = None
 
-    def prep_ml_dataset(self, df, primary_id_field="_healpix_29", fields=None):
+    def prep_ml_dataset(self, df):
         """Prepare the ML dataset for inference if it hasn't been prepared yet."""
 
         # Build the data request for inference
         data = {
             "dataset_class": "DataframeDataset",
             "data_location": create_meta_dict(df),
-            "primary_id_field": primary_id_field,  # ^ can come from self.config???
+            "primary_id_field": self.model_config.primary_id_field,
         }
 
         # Include fields if provided, excluding uses _all_ available fields by default
-        if fields is not None:
-            data["fields"] = fields
+        if self.model_config.input_fields is not None:
+            data["fields"] = self.model_config.input_fields
 
         data_request = {"infer": {"data": data}}
         self.config["data_request"] = data_request
@@ -90,7 +107,9 @@ def _predict_with_worker(df, process_fn, dataset, config, output_fields):
         # not the bare dataset class.
         dataset.prepped_datasets["data"].data = df
 
-        #! Be aware, this is Pytorch-ignite.
+        # ^ We could create our own dataloader here instead of using Hyrax's dist_data_loader
+        # ^ This might provide a small efficiency gain by avoid repeatedly creating
+        # ^ a dataloader here.
         data_loader = dist_data_loader(dataset, config)
 
         # Preallocate the output columns so each batch can be written in place.
@@ -128,8 +147,6 @@ def _predict_with_worker(df, process_fn, dataset, config, output_fields):
 def _predict(
     df,
     plugin_name: str = DEFAULT_PLUGIN_NAME,
-    primary_id_field: str = "_healpix_29",
-    input_fields: list[str] | None = None,
     output_fields=None,
 ):
     """This is UDF that is provided to `catalog.map_partitions(...).
@@ -142,19 +159,13 @@ def _predict(
         The input DataFrame containing the data for inference.
     plugin_name : str, optional
         Name of the registered Hyrax plugin to use, by default DEFAULT_PLUGIN_NAME.
-    primary_id_field : str, optional
-        The primary ID field in the DataFrame, by default "_healpix_29".
-    input_fields : list of str, optional
-        List of fields to include in the inference dataset, by default None.
     output_fields : pd.DataFrame
         DataFrame specifying the output fields and their dtypes, by default None.
     """
 
     # Prep dataset for inference on the first call, only instantiated once.
     if not get_worker().plugins[plugin_name].dataset_prepped:
-        get_worker().plugins[plugin_name].prep_ml_dataset(
-            df=df, primary_id_field=primary_id_field, fields=input_fields
-        )
+        get_worker().plugins[plugin_name].prep_ml_dataset(df)
 
     return _predict_with_worker(
         df,
@@ -167,20 +178,17 @@ def _predict(
 
 def register_hyrax_plugin(
     client: Client,
-    config: dict = None,
+    model_config: ModelConfig = None,
     plugin_name: str = DEFAULT_PLUGIN_NAME,
 ):
-    """Prepares the Hyrax instance and registers the worker plugin with the Dask client.
-
-    This function sets up the Hyrax configuration, builds the data request for inference,
-    and registers the TorchModelPlugin with the specified client.
+    """Registers the worker plugin with the Dask client.
 
     Parameters
     ----------
     client : Client
         The Dask client to register the plugin with.
-    config : dict, optional
-        Configuration dictionary for Hyrax, by default None.
+    model_config : ModelConfig, optional
+        Configuration object for the Hyrax model, by default None.
     plugin_name : str, optional
         Name of the plugin to register, by default DEFAULT_PLUGIN_NAME.
 
@@ -190,34 +198,18 @@ def register_hyrax_plugin(
         If the id_field is not specified or not present in the catalog.
     """
 
-    # For this `config` to work, we need to update Hyrax so that it can accept a plain dictionary
-    if config is None:
-        config = {}
-    h = hyrax.Hyrax()
-
-    # call h.set_config("key.sub_key", value) for each key-value pair in the config dictionary
-    if config is not None:
-        for key, value in config.items():
-            for sub_key, sub_value in value.items():
-                h.set_config(f"{key}.{sub_key}", sub_value)
-
-    # Never use caching for inference
-    h.set_config("data_set.use_cache", False)
-
     if client is None:
         client = get_client()
 
-    client.register_plugin(TorchModelPlugin(plugin_name, h.config))
+    client.register_plugin(TorchModelPlugin(plugin_name, model_config))
 
 
 def predict(
     df,
     plugin_name: str = DEFAULT_PLUGIN_NAME,
-    primary_id_field: str = "_healpix_29",
-    input_fields: list = None,
-    output_fields: pd.DataFrame = None,
 ):
-    """Main prediction function for the Hyrax worker plugin.
+    """Main prediction function, should call `df.map_partitions(_predict)`
+    internally.
 
     Parameters
     ----------
@@ -225,12 +217,6 @@ def predict(
         Input DataFrame containing the data to be used for prediction.
     plugin_name : str, optional
         Name of the plugin to use for prediction, by default DEFAULT_PLUGIN_NAME
-    primary_id_field : str, optional
-        Name of the primary ID field in the DataFrame, by default "_healpix_29"
-    input_fields : list, optional
-        List of input field names to be used for prediction, by default None
-    output_fields : pd.DataFrame, optional
-        DataFrame containing the output fields for prediction, by default None
 
     Returns
     -------
@@ -238,13 +224,14 @@ def predict(
         DataFrame containing the prediction results.
     """
 
+    # ^ Having trouble getting the worker here.
+    output_fields = get_worker().plugins[plugin_name].model_config.output_fields
+
     meta = df._operation.meta.copy(deep=True).join(output_fields, how="left")
 
     return df.map_partitions(
         _predict,
         plugin_name=plugin_name,
-        primary_id_field=primary_id_field,
-        input_fields=input_fields,
         output_fields=output_fields,
         meta=meta,
     )
