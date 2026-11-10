@@ -5,7 +5,7 @@ import torch
 from conftest import N_ROWS
 from torch.utils.data import DataLoader
 
-from lsdb_ml import CatalogDataset, collate_catalog
+from lsdb_ml import CatalogDataLoader, CatalogDataset, collate_catalog
 
 
 def collect(dataset, **loader_kwargs):
@@ -16,6 +16,13 @@ def collect(dataset, **loader_kwargs):
 def all_ids(batches):
     """Concatenate the ``id`` column of all batches."""
     return torch.cat([batch["id"] for batch in batches]).numpy()
+
+
+def epoch_order(catalog, seed, epoch):
+    """The row order of one epoch, iterated with a plain DataLoader and an explicit epoch."""
+    dataset = CatalogDataset(catalog[["id"]], batch_size=10, seed=seed)
+    dataset.set_epoch(epoch)
+    return all_ids(collect(dataset)).tolist()
 
 
 def test_flat_columns(nested_catalog):
@@ -113,17 +120,10 @@ def test_batch_sizes(nested_catalog, shuffle, shuffle_buffer_size, drop_last):
 
 def test_shuffle_is_seeded(nested_catalog):
     """The same seed and epoch give the same order; another epoch or seed gives another order."""
-    catalog = nested_catalog[["id"]]
-
-    def order(seed, epoch):
-        dataset = CatalogDataset(catalog, batch_size=10, seed=seed)
-        dataset.set_epoch(epoch)
-        return all_ids(collect(dataset)).tolist()
-
-    first = order(seed=1, epoch=0)
-    assert order(seed=1, epoch=0) == first
-    assert order(seed=1, epoch=1) != first
-    assert order(seed=2, epoch=0) != first
+    first = epoch_order(nested_catalog, seed=1, epoch=0)
+    assert epoch_order(nested_catalog, seed=1, epoch=0) == first
+    assert epoch_order(nested_catalog, seed=1, epoch=1) != first
+    assert epoch_order(nested_catalog, seed=2, epoch=0) != first
     assert sorted(first) == list(range(N_ROWS))
     assert first != list(range(N_ROWS))
 
@@ -168,3 +168,74 @@ def test_custom_collate_fn():
     assert len(batches) == 10
     assert set(batches[0]) == {"id", "bands"}
     assert set().union(*(batch["bands"] for batch in batches)) <= {"g", "r"}
+
+
+def test_loader_yields_unwrapped_batches(nested_catalog):
+    """CatalogDataLoader does not add a leading batch dimension to the dataset's batches."""
+    loader = CatalogDataLoader(CatalogDataset(nested_catalog[["id", "lc"]], batch_size=16, seed=0))
+    batches = list(loader)
+
+    assert batches[0]["id"].shape == (16,)
+    assert batches[0]["lc"]["mask"].shape[0] == 16
+    assert sorted(all_ids(batches)) == list(range(N_ROWS))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"batch_size": 4}, {"shuffle": True}, {"drop_last": True}, {"collate_fn": collate_catalog}],
+)
+def test_loader_rejects_dataset_options(nested_catalog, kwargs):
+    """Options that belong on the dataset raise; their default values are accepted."""
+    dataset = CatalogDataset(nested_catalog[["id"]], batch_size=10)
+    with pytest.raises(ValueError, match="set on the CatalogDataset"):
+        CatalogDataLoader(dataset, **kwargs)
+    CatalogDataLoader(dataset, batch_size=None, shuffle=False, drop_last=False, collate_fn=None)
+
+
+def test_loader_needs_catalog_dataset():
+    """CatalogDataLoader only wraps a CatalogDataset."""
+    with pytest.raises(TypeError, match="CatalogDataset"):
+        CatalogDataLoader([1, 2, 3])
+
+
+def test_loader_advances_epoch(nested_catalog):
+    """Each pass over the loader uses the next epoch's shuffle order."""
+    dataset = CatalogDataset(nested_catalog[["id"]], batch_size=10, seed=1)
+    loader = CatalogDataLoader(dataset)
+
+    passes = [all_ids(list(loader)).tolist() for _ in range(3)]
+
+    assert passes == [epoch_order(nested_catalog, seed=1, epoch=epoch) for epoch in range(3)]
+    assert dataset.epoch == 2
+
+
+def test_loader_respects_set_epoch(nested_catalog):
+    """An epoch set by the user is used as is, and the loader continues from it."""
+    dataset = CatalogDataset(nested_catalog[["id"]], batch_size=10, seed=1)
+    loader = CatalogDataLoader(dataset)
+
+    dataset.set_epoch(5)
+    assert all_ids(list(loader)).tolist() == epoch_order(nested_catalog, seed=1, epoch=5)
+    assert all_ids(list(loader)).tolist() == epoch_order(nested_catalog, seed=1, epoch=6)
+    # Setting the epoch every pass, DistributedSampler style, is not double-advanced.
+    dataset.set_epoch(7)
+    list(loader)
+    assert dataset.epoch == 7
+
+
+def test_loader_advances_epoch_in_workers(nested_catalog):
+    """Workers see the new epoch, since it is set before they copy the dataset."""
+    dataset = CatalogDataset(nested_catalog[["id"]], batch_size=8, seed=0)
+    loader = CatalogDataLoader(dataset, num_workers=2, multiprocessing_context="fork")
+
+    first, second = all_ids(list(loader)), all_ids(list(loader))
+
+    assert sorted(first) == sorted(second) == list(range(N_ROWS))
+    assert first.tolist() != second.tolist()
+
+
+def test_loader_warns_on_persistent_workers(nested_catalog):
+    """Persistent workers never see the new epoch, so the loader warns."""
+    dataset = CatalogDataset(nested_catalog[["id"]], batch_size=10, seed=0)
+    with pytest.warns(UserWarning, match="persistent_workers"):
+        CatalogDataLoader(dataset, num_workers=2, persistent_workers=True)

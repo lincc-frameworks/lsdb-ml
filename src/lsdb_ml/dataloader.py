@@ -1,5 +1,6 @@
 """Stream an LSDB catalog into PyTorch as batches of tensors."""
 
+import warnings
 from collections.abc import Callable, Iterator
 from functools import partial
 from typing import Any
@@ -12,7 +13,7 @@ import pyarrow as pa
 import torch
 from lsdb import Catalog
 from lsdb.streams import CatalogStream
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 
 def collate_catalog(frame: npd.NestedFrame, max_length: int | dict[str, int] | None = None) -> dict[str, Any]:
@@ -134,10 +135,14 @@ class CatalogDataset(IterableDataset):
 
     Data is computed a few partitions at a time with `lsdb.streams.CatalogStream`, so
     the catalog is never fully materialized. The dataset yields ready-made batches (it
-    batches and collates itself, which is much faster than collating row by row), so wrap
-    it in a ``DataLoader`` with ``batch_size=None``::
+    batches and collates itself, which is much faster than collating row by row). Iterate
+    it with `CatalogDataLoader`, which also advances the shuffle order every epoch::
 
-        loader = DataLoader(CatalogDataset(catalog, batch_size=64, seed=0), batch_size=None)
+        loader = CatalogDataLoader(CatalogDataset(catalog, batch_size=64, seed=0))
+
+    A plain ``DataLoader(dataset, batch_size=None)`` works too, but then you must call
+    `set_epoch` yourself. Without ``batch_size=None``, torch batches the batches and
+    silently adds a leading dimension.
 
     **Batches.** Each batch is ``collate_fn`` applied to a `nested_pandas.NestedFrame` of
     ``batch_size`` rows; see `collate_catalog` for the default output. Each data stream
@@ -158,15 +163,16 @@ class CatalogDataset(IterableDataset):
     cost of memory.
 
     With a ``seed``, the order is reproducible for a given epoch and number of workers.
-    Call `set_epoch` before each epoch to get a new order, as with
-    ``torch.utils.data.DistributedSampler``; otherwise every epoch repeats the same order.
+    The epoch selects the order: `CatalogDataLoader` advances it on every pass, and with a
+    plain ``DataLoader`` you call `set_epoch` before each epoch, as with
+    ``torch.utils.data.DistributedSampler``. Otherwise every epoch repeats the same order.
     Without a ``seed``, a random one is drawn when the dataset is created.
 
-    **Multiple workers.** With ``DataLoader(num_workers=k)``, each worker streams a disjoint
+    **Multiple workers.** With ``num_workers=k`` on the loader, each worker streams a disjoint
     subset of partitions, so every row is yielded exactly once per epoch. Workers compute
     their partitions in-process with dask's synchronous scheduler, because dask's default
     threaded scheduler can hang in forked worker processes. The ``client`` is used only when
-    ``num_workers=0``. With ``persistent_workers=True``, `set_epoch` does not reach the
+    ``num_workers=0``. With ``persistent_workers=True``, the epoch does not reach the
     workers, so every epoch repeats the same order.
 
     Parameters
@@ -206,15 +212,12 @@ class CatalogDataset(IterableDataset):
     A minimal training loop on a small synthetic catalog:
 
     >>> import lsdb, torch
-    >>> from torch.utils.data import DataLoader
-    >>> from lsdb_ml import CatalogDataset
+    >>> from lsdb_ml import CatalogDataLoader, CatalogDataset
     >>> catalog = lsdb.generate_catalog(200, 10, seed=1)[["a", "b"]]
-    >>> dataset = CatalogDataset(catalog, batch_size=32, seed=0)
-    >>> loader = DataLoader(dataset, batch_size=None)
+    >>> loader = CatalogDataLoader(CatalogDataset(catalog, batch_size=32, seed=0))
     >>> model = torch.nn.Linear(1, 1)
     >>> optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
     >>> for epoch in range(2):
-    ...     dataset.set_epoch(epoch)
     ...     for batch in loader:
     ...         x, y = batch["a"].float()[:, None], batch["b"].float()[:, None]
     ...         loss = torch.nn.functional.mse_loss(model(x), y)
@@ -318,3 +321,55 @@ class CatalogDataset(IterableDataset):
             if len(rows) < self.batch_size and self.drop_last:
                 break
             yield self.collate_fn(rows)
+
+
+class CatalogDataLoader(DataLoader):
+    """A ``torch.utils.data.DataLoader`` for a `CatalogDataset`.
+
+    `CatalogDataset` already batches and collates, so this loader sets ``batch_size=None``
+    and rejects the options that belong on the dataset instead (``batch_size``,
+    ``shuffle``, ``sampler``, ``batch_sampler``, ``collate_fn``, ``drop_last``).
+
+    It also advances the dataset's epoch at the start of every pass after the first, so
+    each epoch gets a new shuffle order. Calling `CatalogDataset.set_epoch` yourself still
+    works (e.g. to resume at a given epoch): if the epoch was changed since the last pass,
+    that epoch is used as is.
+
+    Everything else (``num_workers``, ``pin_memory``, ``prefetch_factor``, ...) is passed to
+    ``DataLoader`` unchanged. With ``persistent_workers=True`` the workers keep their copy
+    of the dataset, so the epoch does not reach them and every epoch repeats the same order.
+
+    Parameters
+    ----------
+    dataset : CatalogDataset
+        The dataset to iterate.
+    **kwargs
+        Other ``torch.utils.data.DataLoader`` arguments.
+    """
+
+    _DATASET_OPTIONS = ("batch_size", "shuffle", "sampler", "batch_sampler", "collate_fn", "drop_last")
+
+    def __init__(self, dataset: CatalogDataset, **kwargs) -> None:
+        if not isinstance(dataset, CatalogDataset):
+            raise TypeError(f"CatalogDataLoader needs a CatalogDataset, not {type(dataset).__name__}.")
+        # Allow the default values, e.g. when a framework rebuilds the loader from its attributes.
+        conflicts = [key for key in self._DATASET_OPTIONS if kwargs.pop(key, None)]
+        if conflicts:
+            raise ValueError(
+                f"{conflicts} are set on the CatalogDataset, not the CatalogDataLoader, "
+                "because the dataset already yields batches."
+            )
+        if kwargs.get("persistent_workers") and kwargs.get("num_workers", 0) > 0 and dataset.shuffle:
+            warnings.warn(
+                "With persistent_workers=True, the epoch does not reach the workers, "
+                "so every epoch repeats the same shuffle order."
+            )
+        super().__init__(dataset, batch_size=None, **kwargs)
+        self._last_epoch = None
+
+    def __iter__(self):
+        # Set the epoch before the workers start, since they copy the dataset at that point.
+        if self._last_epoch is not None and self.dataset.epoch == self._last_epoch:
+            self.dataset.set_epoch(self._last_epoch + 1)
+        self._last_epoch = self.dataset.epoch
+        return super().__iter__()
