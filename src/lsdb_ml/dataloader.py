@@ -150,17 +150,15 @@ class CatalogDataset(IterableDataset):
     unless ``drop_last=True``.
 
     **Shuffling.** A true global shuffle would need the whole catalog in memory, so
-    shuffling is approximate, in three layers:
+    shuffling is approximate, in two layers:
 
     1. The order of partitions is randomly permuted each epoch.
     2. Rows within each chunk of ``partitions_per_chunk`` partitions are shuffled.
-    3. A buffer of ``shuffle_buffer_size`` rows is carried from chunk to chunk and shuffled
-       with each new chunk, so batches mix rows from consecutive chunks.
 
-    Rows from partitions that are far apart in the streaming order never share a batch.
-    Since partitions are spatially contiguous, a batch is drawn from only a few regions of
-    the sky. A larger ``partitions_per_chunk`` or ``shuffle_buffer_size`` mixes more, at the
-    cost of memory.
+    A batch is drawn from a single chunk, except that rows left over at the end of a chunk
+    fill the start of the next batch. Since partitions are spatially contiguous, a batch
+    is drawn from only a few regions of the sky. A larger ``partitions_per_chunk`` mixes
+    more, at the cost of memory.
 
     With a ``seed``, the order is reproducible for a given epoch and number of workers.
     The epoch selects the order: `CatalogDataLoader` advances it on every pass, and with a
@@ -188,9 +186,6 @@ class CatalogDataset(IterableDataset):
         batched without any shuffling.
     seed : int or None
         Seed for all shuffling.
-    shuffle_buffer_size : int
-        Number of rows carried over between chunks to mix with the next chunk. 0 means
-        rows only mix within a chunk. Ignored if ``shuffle`` is False.
     partitions_per_chunk : int
         Number of partitions computed together into one chunk.
     drop_last : bool
@@ -233,7 +228,6 @@ class CatalogDataset(IterableDataset):
         *,
         shuffle: bool = True,
         seed: int | None = None,
-        shuffle_buffer_size: int = 1024,
         partitions_per_chunk: int = 1,
         drop_last: bool = False,
         max_length: int | dict[str, int] | None = None,
@@ -257,7 +251,6 @@ class CatalogDataset(IterableDataset):
         self.shuffle = shuffle
         # Every worker must derive the same partition permutation, so they need a shared seed.
         self.seed = seed if seed is not None else int(np.random.SeedSequence().generate_state(1)[0])
-        self.shuffle_buffer_size = shuffle_buffer_size if shuffle else 0
         self.partitions_per_chunk = partitions_per_chunk
         self.drop_last = drop_last
         self.collate_fn = collate_fn
@@ -300,27 +293,21 @@ class CatalogDataset(IterableDataset):
             shuffle=self.shuffle,
             seed=int(rng.integers(2**31)),
         )
-        yield from self._batches(stream, rng)
+        yield from self._batches(stream)
 
-    def _batches(self, chunks: Iterator[npd.NestedFrame], rng: np.random.Generator) -> Iterator[Any]:
-        buffer = None
+    def _batches(self, chunks: Iterator[npd.NestedFrame]) -> Iterator[Any]:
+        # CatalogStream already shuffles the rows of each chunk, so just cut them into batches.
+        leftover = None
         for chunk in chunks:
-            buffer = chunk if buffer is None else pd.concat([buffer, chunk])
-            if self.shuffle:
-                buffer = buffer.iloc[rng.permutation(len(buffer))]
-            # Emit full batches, keeping up to `shuffle_buffer_size` rows to mix with the next chunk.
-            n_batches = max(len(buffer) - self.shuffle_buffer_size, 0) // self.batch_size
-            for i in range(n_batches):
-                yield self.collate_fn(buffer.iloc[i * self.batch_size : (i + 1) * self.batch_size])
-            buffer = buffer.iloc[n_batches * self.batch_size :]
+            rows = chunk if leftover is None else pd.concat([leftover, chunk])
+            n_full = len(rows) // self.batch_size * self.batch_size
+            for start in range(0, n_full, self.batch_size):
+                yield self.collate_fn(rows.iloc[start : start + self.batch_size])
+            # Carry the rows that don't fill a batch over to the next chunk.
+            leftover = rows.iloc[n_full:]
 
-        if buffer is None:
-            return
-        for start in range(0, len(buffer), self.batch_size):
-            rows = buffer.iloc[start : start + self.batch_size]
-            if len(rows) < self.batch_size and self.drop_last:
-                break
-            yield self.collate_fn(rows)
+        if leftover is not None and len(leftover) > 0 and not self.drop_last:
+            yield self.collate_fn(leftover)
 
 
 class CatalogDataLoader(DataLoader):

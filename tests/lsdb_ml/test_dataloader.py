@@ -92,19 +92,17 @@ def test_max_length_errors(nested_catalog):
         CatalogDataset(nested_catalog, batch_size=10, max_length=5, collate_fn=collate_catalog)
 
 
-@pytest.mark.parametrize(
-    ("shuffle", "shuffle_buffer_size"),
-    [(False, 0), (True, 0), (True, 15), (True, 1024)],
-)
+@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize("partitions_per_chunk", [1, 3])
 @pytest.mark.parametrize("drop_last", [False, True])
-def test_batch_sizes(nested_catalog, shuffle, shuffle_buffer_size, drop_last):
+def test_batch_sizes(nested_catalog, shuffle, partitions_per_chunk, drop_last):
     """All batches are full except a final partial batch, which drop_last removes."""
     dataset = CatalogDataset(
         nested_catalog[["id"]],
         batch_size=7,
         shuffle=shuffle,
         seed=0,
-        shuffle_buffer_size=shuffle_buffer_size,
+        partitions_per_chunk=partitions_per_chunk,
         drop_last=drop_last,
     )
     batches = collect(dataset)
