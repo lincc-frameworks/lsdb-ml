@@ -1,8 +1,11 @@
+import pickle
+
 import lsdb
 import numpy as np
 import pytest
 import torch
 from conftest import N_ROWS
+from dask.distributed import Client
 from torch.utils.data import DataLoader
 
 from lsdb_ml import CatalogDataLoader, CatalogDataset, collate_catalog
@@ -145,6 +148,84 @@ def test_workers_yield_each_row_once(nested_catalog, context):
     batches = collect(dataset, num_workers=2, multiprocessing_context=context)
 
     assert sorted(all_ids(batches)) == list(range(N_ROWS))
+
+
+def keep_ids_from(threshold):
+    """A closure, which standard pickle cannot serialize."""
+
+    def keep(df):
+        return df[df["id"] >= threshold]
+
+    return keep
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        pytest.param(lambda catalog: catalog.query("id >= 0"), id="query"),
+        pytest.param(lambda catalog: catalog.map_partitions(lambda df: df[df["id"] >= 0]), id="lambda"),
+        pytest.param(lambda catalog: catalog.map_partitions(keep_ids_from(0)), id="closure"),
+    ],
+)
+def test_pickling_keeps_user_functions(nested_catalog, transform):
+    """The dataset pickles with functions standard pickle rejects, in the catalog and collate_fn."""
+    dataset = CatalogDataset(
+        transform(nested_catalog[["id"]]),
+        batch_size=8,
+        seed=0,
+        collate_fn=lambda frame: collate_catalog(frame),
+    )
+    copy = pickle.loads(pickle.dumps(dataset))
+
+    assert sorted(all_ids(collect(copy))) == list(range(N_ROWS))
+
+
+@pytest.mark.parametrize("context", ["spawn", "forkserver"])
+def test_workers_run_user_functions(nested_catalog, context):
+    """Workers that receive a pickled dataset can run lambdas, closures, query and notebook functions."""
+
+    def notebook_filter(df):
+        return df[df["id"] >= 0]
+
+    # Make it look defined in a notebook: a worker's __main__ is not the notebook, so standard
+    # pickle, which saves functions by name, would fail to find it there.
+    notebook_filter.__module__, notebook_filter.__qualname__ = "__main__", "notebook_filter"
+    catalog = (
+        nested_catalog[["id", "lc"]]
+        .query("id >= 0")
+        .map_partitions(lambda df: df)
+        .map_partitions(keep_ids_from(0))
+        .map_partitions(notebook_filter)
+    )
+    dataset = CatalogDataset(catalog, batch_size=8, seed=0, collate_fn=lambda frame: collate_catalog(frame))
+    batches = collect(dataset, num_workers=2, multiprocessing_context=context)
+
+    assert sorted(all_ids(batches)) == list(range(N_ROWS))
+
+
+def test_pickling_drops_client(nested_catalog):
+    """Workers never use the client, so a pickled copy has none; the dataset itself keeps it."""
+    with Client(processes=False, n_workers=1, dashboard_address=":0") as client:
+        dataset = CatalogDataset(nested_catalog[["id"]], batch_size=10, client=client)
+        copy = pickle.loads(pickle.dumps(dataset))
+
+        assert copy.client is None
+        assert dataset.client is client
+
+
+def test_pickling_reuses_bytes_until_catalog_changes(nested_catalog):
+    """The pickled catalog is reused for every worker, while the epoch is always current."""
+    dataset = CatalogDataset(nested_catalog[["id"]], batch_size=10)
+    first = dataset.__getstate__()["_catalog_and_collate"]
+
+    dataset.set_epoch(3)
+    state = dataset.__getstate__()
+    assert state["_catalog_and_collate"] is first
+    assert pickle.loads(pickle.dumps(dataset)).epoch == 3
+
+    dataset.catalog = nested_catalog[["id", "x"]]
+    assert dataset.__getstate__()["_catalog_and_collate"] is not first
+    assert list(pickle.loads(pickle.dumps(dataset)).catalog.columns) == ["id", "x"]
 
 
 def test_non_numeric_columns_raise():
