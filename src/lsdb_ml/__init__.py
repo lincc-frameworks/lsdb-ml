@@ -1,6 +1,15 @@
 from ._version import __version__
+from .dataloader import CatalogDataLoader, CatalogDataset, collate_catalog
 from .hyrax.client import ml_client
 from .hyrax.config_utils import ModelConfig
 from .hyrax.predict import predict
 
-__all__ = ["__version__", "ml_client", "predict", "ModelConfig"]
+__all__ = [
+    "__version__",
+    "ml_client",
+    "predict",
+    "ModelConfig",
+    "CatalogDataLoader",
+    "CatalogDataset",
+    "collate_catalog",
+]
