@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterator
 from functools import partial
 from typing import Any
 
+import cloudpickle
 import dask
 import nested_pandas as npd
 import numpy as np
@@ -173,6 +174,14 @@ class CatalogDataset(IterableDataset):
     ``num_workers=0``. With ``persistent_workers=True``, the epoch does not reach the
     workers, so every epoch repeats the same order.
 
+    Workers started with the ``"spawn"`` or ``"forkserver"`` method receive a pickled copy of
+    the dataset. The catalog and ``collate_fn`` are pickled with ``cloudpickle``, as dask does,
+    so functions in the catalog's pipeline (e.g. from ``map_partitions`` or ``query``) and the
+    ``collate_fn`` may be lambdas, closures or functions defined in a notebook. Objects that
+    cannot be pickled at all (open files, locks, connections) still fail, and every object a
+    function references is copied to each worker. A catalog built in memory (e.g. with
+    ``lsdb.from_dataframe``) carries its data, so each worker gets a copy of that too.
+
     Parameters
     ----------
     catalog : lsdb.Catalog
@@ -256,6 +265,30 @@ class CatalogDataset(IterableDataset):
         self.collate_fn = collate_fn
         self.client = client
         self.epoch = 0
+        self._pickled = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Standard pickle, which DataLoader uses for "spawn" and "forkserver" workers, rejects
+        # lambdas, closures and notebook functions, so pickle the parts that hold user functions
+        # with cloudpickle. The bytes are reused for every worker until the catalog or collate_fn
+        # changes. Workers never use the client, which may not be picklable.
+        if (
+            self._pickled is None
+            or self._pickled[0] is not self.catalog
+            or self._pickled[1] is not self.collate_fn
+        ):
+            self._pickled = (
+                self.catalog,
+                self.collate_fn,
+                cloudpickle.dumps((self.catalog, self.collate_fn)),
+            )
+        state = self.__dict__.copy()
+        del state["catalog"], state["collate_fn"], state["_pickled"]
+        return {**state, "client": None, "_catalog_and_collate": self._pickled[2]}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.catalog, self.collate_fn = cloudpickle.loads(state.pop("_catalog_and_collate"))
+        self.__dict__.update(state, _pickled=None)
 
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch, which selects the shuffle order for the next iteration.
